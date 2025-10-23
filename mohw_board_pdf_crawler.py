@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Iterable
 import requests
 from bs4 import BeautifulSoup
+from tqdm import tqdm
 
 BASE = "https://www.mohw.go.kr"
 LIST_URL = f"{BASE}/board.es"  # https://www.mohw.go.kr/board.es?mid=a10409020000&bid=0026
@@ -20,6 +21,7 @@ MID = "a10409020000"
 BID = "0026"
 
 OUTDIR = Path("./mohw_pdfs").resolve()
+FLAT_OUTPUT_DIR = OUTDIR / "flat"
 LOG_DIR = Path("./logs").resolve()
 
 # 크롤링 매너
@@ -198,7 +200,7 @@ def _resolve_filename(response, fallback: str) -> str:
     return filename
 
 
-def download_pdf(url: str, stem: str, original_name: str) -> Optional[Path]:
+def download_pdf(url: str, flat_dir: Path, original_name: str) -> Optional[Path]:
     r = get(url, stream=True)
     filename = _resolve_filename(r, original_name)
     filename = sanitize_filename(filename)
@@ -223,9 +225,16 @@ def download_pdf(url: str, stem: str, original_name: str) -> Optional[Path]:
         filename = sanitize_filename(Path(filename).stem) or "document"
         filename = f"{filename}{PDF_EXT}"
 
-    out_dir = OUTDIR / stem
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / filename
+    flat_dir.mkdir(parents=True, exist_ok=True)
+    out_path = flat_dir / filename
+
+    # Resolve potential name collisions by appending an incrementing suffix.
+    counter = 1
+    candidate = out_path
+    while candidate.exists():
+        candidate = flat_dir / f"{Path(filename).stem}_{counter}{PDF_EXT}"
+        counter += 1
+    out_path = candidate
 
     with open(out_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=8192):
@@ -262,19 +271,8 @@ def _process_page(page: int, done_ids: set) -> bool:
         if pdfs:
             for f in pdfs:
                 time.sleep(SLEEP_DOWNLOAD)
-                stem = "_".join(
-                    filter(
-                        None,
-                        [
-                            meta.get("notice_no"),
-                            meta.get("effective"),
-                            meta.get("title_in_list"),
-                        ],
-                    )
-                )
-                stem = sanitize_filename(stem) or "mohw_notice"
                 try:
-                    out = download_pdf(f["url"], stem, f["name"])
+                    out = download_pdf(f["url"], OUTDIR, f["name"])
                     if out:
                         logger.info("Saved PDF: '%s'", out.name)
                 except Exception as exc:
@@ -312,6 +310,35 @@ def crawl_all(
 
     page = max(1, start_page)
     empty_pages = 0
+
+    if page_numbers:
+        unique_pages = sorted({p for p in page_numbers if isinstance(p, int) and p >= 1})
+        total_pages = len(unique_pages)
+        if not unique_pages:
+            logger.info("No valid pages supplied; nothing to do.")
+            return
+        progress = tqdm(total=total_pages, desc="Pages", unit="page", leave=True)
+        for idx, page in enumerate(unique_pages, start=1):
+            _process_page(page, done_ids)
+            logger.info("Progress: %d/%d pages processed", idx, total_pages)
+            time.sleep(SLEEP_LIST)
+            progress.update(1)
+        progress.close()
+        logger.info("Finished requested pages.")
+        return
+
+    final_page = None
+    if end_page is not None and end_page >= page:
+        final_page = end_page
+
+    total_steps = None
+    if final_page is not None:
+        total_steps = final_page - page + 1
+    else:
+        total_steps = None
+
+    progress = tqdm(total=total_steps, desc="Pages", unit="page", leave=True)
+
     while True:
         if end_page is not None and page > end_page:
             break
@@ -319,15 +346,19 @@ def crawl_all(
         processed = _process_page(page, done_ids)
 
         if processed:
+            logger.info("Completed page %s", page)
             empty_pages = 0
         else:
+            logger.info("Page %s had no data or failed", page)
             empty_pages += 1
             if empty_pages >= 2:
                 break
 
         page += 1
         time.sleep(SLEEP_LIST)
+        progress.update(1)
 
+    progress.close()
     logger.info("Finished crawl.")
 
 
